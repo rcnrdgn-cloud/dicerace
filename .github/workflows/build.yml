@@ -1,6 +1,6 @@
 name: Zar Yarışı derle
 
-# Zar Yarışı (sürüm 0.2): tüm kod ve sesler bu dosyanın içinden üretilir.
+# Zar Yarışı (sürüm 0.3): tüm kod ve sesler bu dosyanın içinden üretilir.
 # Depoda başka hiçbir dosyaya gerek yoktur.
 
 on:
@@ -783,7 +783,7 @@ jobs:
 
             void _track(Canvas canvas, Cam cam) {
               final t = Track.I;
-              final yNear = cam.eyeY + Cam.near + 0.05;
+              final yNear = cam.eyeY + 1.0; // kameranın dibindeki parçalar çizilmez
               final yFar = cam.eyeY + 85;
               // uzaktan yakına şeritler: yakında ince, uzakta kalın
               final ys = <double>[];
@@ -832,13 +832,13 @@ jobs:
                         Paint()
                           ..color = _fog(const Color(0xCCFFFFFF), depth)
                           ..strokeWidth = max(1.0, 0.08 * cam.scaleAt(m5)));
-                    if (depth < 35) {
+                    if (depth < 20) {
                       final tp = TextPainter(
                         text: TextSpan(
                             text: '${m5.round()} m',
                             style: TextStyle(
                                 color: _fog(const Color(0xFF3A4450), depth),
-                                fontSize: (0.35 * cam.scaleAt(m5)).clamp(8.0, 22.0).toDouble(),
+                                fontSize: (0.35 * cam.scaleAt(m5)).clamp(9.0, 16.0).toDouble(),
                                 fontWeight: FontWeight.w800)),
                         textDirection: TextDirection.ltr,
                       )..layout();
@@ -876,8 +876,10 @@ jobs:
               const s = RaceSim.dieSize, hs = s / 2;
               final cx = Track.I.centerX(d.y) + d.x;
               final depth = d.y - cam.eyeY;
-              if (depth < Cam.near + hs) return;
-              final fade = d.z < 0 ? (1 + d.z / 1.5).clamp(0.0, 1.0).toDouble() : 1.0;
+              // kameranın çok yakınındaki (arkada kalmış) zar dev görünmesin: yaklaştıkça silinir
+              if (depth < 1.6) return;
+              final nearFade = ((depth - 1.6) / 1.0).clamp(0.0, 1.0).toDouble();
+              final fade = (d.z < 0 ? (1 + d.z / 1.5).clamp(0.0, 1.0).toDouble() : 1.0) * nearFade;
               if (fade <= 0) return;
 
               // gölge
@@ -1088,8 +1090,9 @@ jobs:
                   return Offset(lead.x, lead.y);
                 }
               }
+              // beklerken: geride kalan zar da görünsün diye kamera arkadaki zara göre durur
               final mine = sim.diceOf(turn).toList();
-              return Offset((mine[0].x + mine[1].x) / 2, (mine[0].y + mine[1].y) / 2);
+              return Offset((mine[0].x + mine[1].x) / 2, min(mine[0].y, mine[1].y) + 1.0);
             }
 
             void _onTick(Duration elapsed) {
