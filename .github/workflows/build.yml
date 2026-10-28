@@ -1,6 +1,6 @@
 name: Zar Yarışı derle
 
-# Zar Yarışı (sürüm 0.1): tüm kod ve sesler bu dosyanın içinden üretilir.
+# Zar Yarışı (sürüm 0.2): tüm kod ve sesler bu dosyanın içinden üretilir.
 # Depoda başka hiçbir dosyaya gerek yoktur.
 
 on:
@@ -282,6 +282,9 @@ jobs:
                 case RHit.clack:
                   sound(_pick('clack', 4), volume: 0.25 + 0.75 * s, pan: pan);
                   haptic(s * 0.8, baseMs: 6);
+                case RHit.rail:
+                  sound(_pick('rail', 4), volume: 0.25 + 0.75 * s, pan: pan);
+                  haptic(s * 0.9, baseMs: 12);
                 case RHit.fall:
                   sound(_pick('floor', 3), volume: 0.5, pan: pan);
                   haptic(0.2, baseMs: 8);
@@ -360,11 +363,72 @@ jobs:
             static const knockedOffPenalty = 3.0; // rakibin yoldan düşürdüğü zar bu kadar geri gelir (m)
           }
           ZAR_EOF
+          cat > lib/track.dart <<'ZAR_EOF'
+          import 'dart:math';
+
+          /// Pist bölümlerinin türleri.
+          enum SegKind { start, wide, plank, narrow }
+
+          class Seg {
+            const Seg(this.from, this.to, this.kind);
+            final double from, to;
+            final SegKind kind;
+
+            /// Yolun yarı genişliği (m).
+            double get half => switch (kind) {
+                  SegKind.start || SegKind.wide => 1.6,
+                  SegKind.plank => 1.25,
+                  SegKind.narrow => 0.95,
+                };
+
+            /// Korkuluk var mı: varsa zar seker, yoksa yoldan düşebilir.
+            bool get rails => kind == SegKind.start || kind == SegKind.wide;
+          }
+
+          /// Havada süzülen pist. Her cihazda aynı (sabit tohum): çevrimiçi oyunda iki
+          /// oyuncu da birebir aynı pisti görür.
+          class Track {
+            Track._() {
+              final rng = Random(2026);
+              final list = <Seg>[const Seg(-20, 10, SegKind.start)];
+              var y = 10.0;
+              var i = 0;
+              while (y < 600) {
+                var k = i < 2 ? const [SegKind.plank, SegKind.wide][i] : const [SegKind.wide, SegKind.plank, SegKind.narrow][rng.nextInt(3)];
+                if (list.last.kind == SegKind.narrow && k == SegKind.narrow) k = SegKind.wide;
+                final len = k == SegKind.narrow ? 5 + rng.nextDouble() * 3 : 10 + rng.nextDouble() * 8;
+                list.add(Seg(y, y + len, k));
+                y += len;
+                i++;
+              }
+              segs = list;
+            }
+
+            static final Track I = Track._();
+            late final List<Seg> segs;
+
+            Seg at(double y) {
+              for (final s in segs) {
+                if (y < s.to) return s;
+              }
+              return segs.last;
+            }
+
+            /// Pistin orta çizgisinin yana kayması (m): yol kıvrılarak uzar.
+            /// Fizik yolun kendi ekseninde çalışır; kıvrım yalnızca görüntüdür.
+            double centerX(double y) {
+              final ease = (y / 12).clamp(0.0, 1.0).toDouble();
+              return ease * (1.4 * sin(y / 15) + 0.6 * sin(y / 6.3 + 1.1));
+            }
+          }
+          ZAR_EOF
           cat > lib/race_physics.dart <<'ZAR_EOF'
           import 'dart:math';
 
+          import 'track.dart';
+
           /// Yarış fiziğinde duyulan/hissedilen olaylar.
-          enum RHit { bounce, roll, clack, fall }
+          enum RHit { bounce, roll, clack, fall, rail }
 
           /// [strength] 0..1: olayın sertliği. [pan]: -1 sol, 1 sağ.
           typedef RHitFn = void Function(RHit kind, double strength, double pan);
@@ -378,11 +442,12 @@ jobs:
             double x = 0, y = 0, z = 0, vx = 0, vy = 0, vz = 0;
             double ang = 0, spin = 0; // ekranda dönüş açısı ve takla hızı
             int face = 6; // şu an üstte görünen sayı
+            int next = 4; // yuvarlanınca üste gelecek sayı (arka yüz)
+            double rollT = 0; // devrilmenin ilerlemesi (0..1): görüntüde öne doğru takla
             int result = 6; // bu atışta gelecek sayı (atış anında belirlenir)
             double startX = 0, startY = 0; // atış öncesi yeri
             bool moving = false, fallen = false;
             double squash = 0; // sert düşüşte yassılma (0..1)
-            double rollAcc = 0; // yuvarlanırken yüz değiştirme sayacı
           }
 
           /// Yarış yolu fiziği. Aynı tohum ve güçle her cihazda birebir aynı hareketi üretir
@@ -392,7 +457,6 @@ jobs:
 
             final RHitFn onHit;
 
-            static const roadWidth = 3.2; // yolun genişliği (m)
             static const dieSize = 0.42; // zarın kenarı (m)
             static const gravity = 22.0; // çizgi film yerçekimi (m/s²)
             static const friction = 5.0; // yuvarlanma sürtünmesi (m/s²)
@@ -421,6 +485,8 @@ jobs:
                   ..vz = 0
                   ..ang = 0
                   ..face = 6
+                  ..next = 4
+                  ..rollT = 0
                   ..moving = false
                   ..fallen = false
                   ..squash = 0;
@@ -443,13 +509,14 @@ jobs:
                 results.add(d.result);
                 final speed = 3.0 + 10.0 * power;
                 final spread = 0.06 + sideSpread * power;
-                final a = (_rng.nextDouble() - 0.5) * 2 * spread;
+                final a = (_rng.nextDouble() - 0.5) * 2 * spread - d.x * 0.04; // hafifçe ortaya doğru
                 d.vx = speed * sin(a);
                 d.vy = speed * cos(a) * (0.9 + 0.2 * _rng.nextDouble());
                 d.vz = 1.2 + 3.5 * power * (0.8 + 0.4 * _rng.nextDouble());
                 d.z = 0.05;
                 d.spin = 8 + 18 * power;
-                d.rollAcc = 0;
+                d.rollT = 0;
+                d.next = _adjacent(d.face);
                 d.moving = true;
                 d.fallen = false;
               }
@@ -474,12 +541,19 @@ jobs:
               }
             }
 
-            double _pan(RDie d) => (d.x / (roadWidth / 2)).clamp(-1.0, 1.0);
+            double _pan(RDie d) => (d.x / 1.6).clamp(-1.0, 1.0);
 
-            int _nextFace(int f) {
-              var n = 1 + _rng.nextInt(5);
-              if (n >= f) n++;
-              return n;
+            /// Bir sayıya komşu (karşısı olmayan) rastgele bir sayı.
+            int _adjacent(int f) {
+              final opts = [for (var k = 1; k <= 6; k++) if (k != f && k != 7 - f) k];
+              return opts[_rng.nextInt(opts.length)];
+            }
+
+            /// Kenarı üstüne devrildi: arka yüz üste gelir.
+            void _tip(RDie d) {
+              d.rollT -= 1;
+              d.face = d.next;
+              d.next = _adjacent(d.face);
             }
 
             void _stop(RDie d) {
@@ -491,7 +565,11 @@ jobs:
               d.vy = 0;
               d.z = 0;
               d.vz = 0;
-              if (d.moving && d.owner == thrower) d.face = d.result;
+              d.rollT = 0;
+              if (d.moving && d.owner == thrower) {
+                d.face = d.result;
+                d.next = _adjacent(d.face);
+              }
               d.moving = false;
             }
 
@@ -517,11 +595,8 @@ jobs:
                   d.x += d.vx * dt;
                   d.y += d.vy * dt;
                   d.ang += d.spin * dt * 0.3;
-                  d.rollAcc += d.spin * dt * 0.02;
-                  if (d.rollAcc >= 1) {
-                    d.rollAcc = 0;
-                    d.face = _nextFace(d.face);
-                  }
+                  d.rollT += d.spin * dt * 0.05; // havada takla
+                  if (d.rollT >= 1) _tip(d);
                   if (d.z <= 0) {
                     d.z = 0;
                     final imp = -d.vz;
@@ -543,12 +618,11 @@ jobs:
                   }
                   d.x += d.vx * dt;
                   d.y += d.vy * dt;
-                  d.rollAcc += ns * dt;
-                  d.ang += ns * dt * (d.vx >= 0 ? 1.2 : -1.2);
-                  if (d.rollAcc >= dieSize) {
+                  d.rollT += ns * dt / dieSize;
+                  d.ang += (d.vx / (ns + 1)) * dt * 2;
+                  if (d.rollT >= 1) {
                     // kenarı üstüne devrildi: yeni yüz, tık sesi, hızlıyken küçük sıçrama
-                    d.rollAcc -= dieSize;
-                    d.face = _nextFace(d.face);
+                    _tip(d);
                     onHit(RHit.roll, (ns / 10).clamp(0.05, 0.6), _pan(d));
                     if (ns > 4) d.vz = ns * 0.08;
                   }
@@ -558,7 +632,19 @@ jobs:
                   }
                 }
 
-                if (d.x.abs() > roadWidth / 2) {
+                final seg = Track.I.at(d.y);
+                if (seg.rails) {
+                  // korkuluk: zar geri seker
+                  final lim = seg.half - dieSize / 2;
+                  if (d.x.abs() > lim) {
+                    final side = d.x.sign;
+                    d.x = side * lim;
+                    if (d.vx * side > 0) {
+                      onHit(RHit.rail, (d.vx.abs() / 6).clamp(0.0, 1.0), _pan(d));
+                      d.vx = -d.vx * 0.5;
+                    }
+                  }
+                } else if (d.x.abs() > seg.half) {
                   d.fallen = true;
                   d.vz = max(d.vz, 0.5);
                   onHit(RHit.fall, 0.4, _pan(d));
@@ -598,6 +684,314 @@ jobs:
             }
           }
           ZAR_EOF
+          cat > lib/race_view.dart <<'ZAR_EOF'
+          import 'dart:math';
+
+          import 'package:flutter/material.dart';
+
+          import 'race_physics.dart';
+          import 'track.dart';
+
+          const playerColors = [Color(0xFFFF4F9A), Color(0xFF2BB3A3)];
+
+          /// Perspektif kamera: zarların arkasından, hafif yukarıdan bakar.
+          /// Dünya koordinatları (m): x yana, y ileri, z yukarı.
+          class Cam {
+            Cam(this.size, this.eyeX, this.eyeY, this.eyeZ)
+                : f = size.width * 0.9,
+                  horizon = size.height * 0.20;
+
+            final Size size;
+            final double eyeX, eyeY, eyeZ, f, horizon;
+
+            static const near = 0.3;
+
+            /// Ekran konumu; kameranın arkasındaysa null.
+            Offset? p(double x, double y, double z) {
+              final depth = y - eyeY;
+              if (depth < near) return null;
+              return Offset(size.width / 2 + (x - eyeX) * f / depth, horizon + (eyeZ - z) * f / depth);
+            }
+
+            /// O derinlikte 1 metrenin kaç piksel olduğu.
+            double scaleAt(double y) => f / max(near, y - eyeY);
+          }
+
+          /// Havada süzülen pist ve üstündeki zarlar.
+          class RaceView extends CustomPainter {
+            RaceView({required this.sim, required this.camX, required this.camY, required Listenable repaint})
+                : super(repaint: repaint);
+
+            final RaceSim sim;
+            final double camX, camY; // kameranın baktığı nokta (yolun ekseninde)
+
+            static const _sky = Color(0xFFE9ECF0);
+            static const _ink = Color(0xFF2A1A0C);
+            static const _pips = {
+              1: [4],
+              2: [0, 8],
+              3: [0, 4, 8],
+              4: [0, 2, 6, 8],
+              5: [0, 2, 4, 6, 8],
+              6: [0, 2, 3, 5, 6, 8],
+            };
+
+            @override
+            void paint(Canvas canvas, Size size) {
+              final t = Track.I;
+              final cam = Cam(size, t.centerX(camY) + camX * 0.5, camY - 4.2, 3.3);
+
+              // gökyüzü: açık gri, yumuşak bulut lekeleri
+              final rect = Offset.zero & size;
+              canvas.drawRect(
+                rect,
+                Paint()
+                  ..shader = const LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Color(0xFFF6F7F9), _sky, Color(0xFFD7DCE3)],
+                    stops: [0, 0.35, 1],
+                  ).createShader(rect),
+              );
+              final blob = Paint()
+                ..color = const Color(0x22FFFFFF)
+                ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30);
+              final r = Random(7);
+              for (var i = 0; i < 9; i++) {
+                final c = Offset(r.nextDouble() * size.width, size.height * (0.15 + 0.8 * r.nextDouble()));
+                canvas.drawCircle(c, size.width * (0.12 + 0.12 * r.nextDouble()), blob);
+              }
+
+              _track(canvas, cam);
+
+              // zarlar: uzaktan yakına
+              final list = [...sim.dice]..sort((a, b) => b.y.compareTo(a.y));
+              for (final d in list) {
+                _die(canvas, cam, d);
+              }
+            }
+
+            Color _fog(Color c, double depth) {
+              final k = ((depth - 18) / 55).clamp(0.0, 0.85).toDouble();
+              return Color.lerp(c, _sky, k)!;
+            }
+
+            void _quad(Canvas c, Offset? a, Offset? b, Offset? cc, Offset? d, Color color) {
+              if (a == null || b == null || cc == null || d == null) return;
+              c.drawPath(Path()..addPolygon([a, b, cc, d], true), Paint()..color = color);
+            }
+
+            void _track(Canvas canvas, Cam cam) {
+              final t = Track.I;
+              final yNear = cam.eyeY + Cam.near + 0.05;
+              final yFar = cam.eyeY + 85;
+              // uzaktan yakına şeritler: yakında ince, uzakta kalın
+              final ys = <double>[];
+              var y = yNear;
+              while (y < yFar) {
+                ys.add(y);
+                y += (y - cam.eyeY) < 25 ? 0.5 : 1.5;
+              }
+              ys.add(yFar);
+              for (var i = ys.length - 2; i >= 0; i--) {
+                final ya = ys[i], yb = ys[i + 1];
+                final seg = t.at((ya + yb) / 2);
+                final h = seg.half;
+                final ca = t.centerX(ya), cb = t.centerX(yb);
+                final depth = (ya + yb) / 2 - cam.eyeY;
+
+                // pistin alt kalınlığı (boşlukta süzülüyor)
+                final side = _fog(seg.rails ? const Color(0xFF2E8FC9) : const Color(0xFF8A5A2B), depth);
+                for (final sgn in const [-1.0, 1.0]) {
+                  _quad(canvas, cam.p(ca + sgn * h, ya, 0), cam.p(cb + sgn * h, yb, 0), cam.p(cb + sgn * h, yb, -0.35),
+                      cam.p(ca + sgn * h, ya, -0.35), side);
+                }
+                _quad(canvas, cam.p(ca - h, ya, -0.35), cam.p(ca + h, ya, -0.35), cam.p(ca + h, ya, 0), cam.p(ca - h, ya, 0),
+                    _fog(seg.rails ? const Color(0xFF1F6FA0) : const Color(0xFF6B4420), depth));
+
+                // üst yüzey: korkuluklu bölüm mavi, diğerleri ahşap; metre metre hafif ton farkı
+                final stripe = ya.floor().isEven;
+                Color top;
+                if (seg.kind == SegKind.start && ya < 0.6 && yb > 0) {
+                  top = const Color(0xFFFFFFFF);
+                } else if (seg.rails) {
+                  top = stripe ? const Color(0xFF4FB3EA) : const Color(0xFF47A8DE);
+                } else {
+                  top = stripe ? const Color(0xFFD9A86A) : const Color(0xFFCF9D5F);
+                }
+                _quad(canvas, cam.p(ca - h, ya, 0), cam.p(cb - h, yb, 0), cam.p(cb + h, yb, 0), cam.p(ca + h, ya, 0),
+                    _fog(top, depth));
+
+                // her 5 metrede beyaz çizgi
+                final m5 = (yb / 5).floor() * 5.0;
+                if (m5 > ya && m5 <= yb && m5 > 0) {
+                  final cm = t.centerX(m5);
+                  final a = cam.p(cm - h, m5, 0.002), b = cam.p(cm + h, m5, 0.002);
+                  if (a != null && b != null) {
+                    canvas.drawLine(a, b,
+                        Paint()
+                          ..color = _fog(const Color(0xCCFFFFFF), depth)
+                          ..strokeWidth = max(1.0, 0.08 * cam.scaleAt(m5)));
+                    if (depth < 35) {
+                      final tp = TextPainter(
+                        text: TextSpan(
+                            text: '${m5.round()} m',
+                            style: TextStyle(
+                                color: _fog(const Color(0xFF3A4450), depth),
+                                fontSize: (0.35 * cam.scaleAt(m5)).clamp(8.0, 22.0).toDouble(),
+                                fontWeight: FontWeight.w800)),
+                        textDirection: TextDirection.ltr,
+                      )..layout();
+                      final lp = cam.p(cm - h - 0.25, m5, 0);
+                      if (lp != null) tp.paint(canvas, lp - Offset(tp.width, tp.height / 2));
+                    }
+                  }
+                }
+
+                // başlangıç çizgisi: dama
+                if (ya < 0.5 && yb > 0) {
+                  for (var k = 0; k < 10; k++) {
+                    final x0 = -h + 2 * h * k / 10, x1 = -h + 2 * h * (k + 1) / 10;
+                    _quad(canvas, cam.p(ca + x0, 0, 0.003), cam.p(ca + x0, 0.5, 0.003), cam.p(ca + x1, 0.5, 0.003),
+                        cam.p(ca + x1, 0, 0.003), k.isEven ? const Color(0xFF1A1208) : const Color(0xFFFFFFFF));
+                  }
+                }
+
+                // korkuluklar: sarı-siyah çizgili
+                if (seg.rails) {
+                  final band = ((ya * 2).floor()).isEven;
+                  final railC = _fog(band ? const Color(0xFFFFC21A) : const Color(0xFF22201C), depth);
+                  for (final sgn in const [-1.0, 1.0]) {
+                    _quad(canvas, cam.p(ca + sgn * h, ya, 0), cam.p(cb + sgn * h, yb, 0), cam.p(cb + sgn * h, yb, 0.22),
+                        cam.p(ca + sgn * h, ya, 0.22), railC);
+                    _quad(canvas, cam.p(ca + sgn * (h + 0.08), ya, 0.22), cam.p(cb + sgn * (h + 0.08), yb, 0.22),
+                        cam.p(cb + sgn * h, yb, 0.22), cam.p(ca + sgn * h, ya, 0.22), _fog(const Color(0xFF3A3630), depth));
+                  }
+                }
+              }
+            }
+
+            /// Gerçek 3B küp: önce öne doğru takla (devrilme), sonra yana dönüş.
+            void _die(Canvas canvas, Cam cam, RDie d) {
+              const s = RaceSim.dieSize, hs = s / 2;
+              final cx = Track.I.centerX(d.y) + d.x;
+              final depth = d.y - cam.eyeY;
+              if (depth < Cam.near + hs) return;
+              final fade = d.z < 0 ? (1 + d.z / 1.5).clamp(0.0, 1.0).toDouble() : 1.0;
+              if (fade <= 0) return;
+
+              // gölge
+              if (d.z >= 0) {
+                final sc = cam.p(cx, d.y, 0);
+                if (sc != null) {
+                  final w = s * cam.scaleAt(d.y) * (1.1 + d.z * 0.3);
+                  canvas.drawOval(
+                    Rect.fromCenter(center: sc, width: w, height: w * 0.45),
+                    Paint()
+                      ..color = Color.fromRGBO(0, 0, 0, (0.3 - d.z * 0.12).clamp(0.08, 0.3).toDouble())
+                      ..maskFilter = MaskFilter.blur(BlurStyle.normal, 2 + d.z * 6),
+                  );
+                }
+              }
+
+              final pitch = -d.rollT * pi / 2;
+              final yaw = d.ang;
+              final cp = cos(pitch), sp = sin(pitch), cy = cos(yaw), sy = sin(yaw);
+              final sq = 1 - 0.25 * d.squash, wide = 1 + 0.2 * d.squash;
+              List<double> rot(double x, double y, double z) {
+                final y1 = y * cp - z * sp, z1 = y * sp + z * cp; // devrilme (x ekseni)
+                final x2 = x * cy - y1 * sy, y2 = x * sy + y1 * cy; // dönüş (z ekseni)
+                return [x2 * wide, y2 * wide, z1 * sq];
+              }
+
+              final oz = d.z + hs * sq;
+              // yüz numaraları: üst = face, arka = next (devrilince üste gelecek)
+              final others = [for (var k = 1; k <= 6; k++) if (k != d.face && k != 7 - d.face && k != d.next && k != 7 - d.next) k];
+              final side = others.isEmpty ? 2 : others.first;
+              // [eksen, işaret, sayı]
+              final faces = [
+                [2, 1, d.face],
+                [2, -1, 7 - d.face],
+                [1, -1, d.next],
+                [1, 1, 7 - d.next],
+                [0, 1, side],
+                [0, -1, 7 - side],
+              ];
+              final eye = [cam.eyeX, cam.eyeY, cam.eyeZ];
+              final drawn = <(double, List<Offset>, double, int)>[];
+              for (final f in faces) {
+                final ax = f[0], sg = f[1].toDouble(), val = f[2];
+                final b = (ax + 1) % 3, c = (ax + 2) % 3;
+                final pts = <Offset>[];
+                var ok = true;
+                double mx = 0, my = 0, mz = 0;
+                for (final uv in const [
+                  [-1, -1],
+                  [1, -1],
+                  [1, 1],
+                  [-1, 1]
+                ]) {
+                  final l = [0.0, 0.0, 0.0];
+                  l[ax] = sg * hs;
+                  l[b] = uv[0] * hs;
+                  l[c] = uv[1] * hs;
+                  final w = rot(l[0], l[1], l[2]);
+                  final wx = cx + w[0], wy = d.y + w[1], wz = oz + w[2];
+                  mx += wx / 4;
+                  my += wy / 4;
+                  mz += wz / 4;
+                  final q = cam.p(wx, wy, wz);
+                  if (q == null) {
+                    ok = false;
+                    break;
+                  }
+                  pts.add(q);
+                }
+                if (!ok) continue;
+                final nl = [0.0, 0.0, 0.0];
+                nl[ax] = sg;
+                final n = rot(nl[0], nl[1], nl[2]);
+                final toEye = [eye[0] - mx, eye[1] - my, eye[2] - mz];
+                if (n[0] * toEye[0] + n[1] * toEye[1] + n[2] * toEye[2] <= 0) continue;
+                final nn = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                final light = max(0.0, (n[0] * -0.25 + n[1] * -0.45 + n[2] * 0.86) / nn);
+                final dist = sqrt(toEye[0] * toEye[0] + toEye[1] * toEye[1] + toEye[2] * toEye[2]);
+                drawn.add((dist, pts, 0.55 + 0.45 * light, val));
+              }
+              drawn.sort((a, b) => b.$1.compareTo(a.$1));
+              final alpha = (255 * fade).round();
+              for (final f in drawn) {
+                final pts = f.$2;
+                final shade = f.$3;
+                final path = Path()..addPolygon(pts, true);
+                final base = Color.lerp(const Color(0xFF7A6A52), const Color(0xFFFFF6E2), shade)!;
+                canvas.drawPath(path, Paint()..color = _fog(base, depth).withAlpha(alpha));
+                // benekler: yüzün içinde çift doğrusal konum
+                final edge = ((pts[1] - pts[0]).distance + (pts[2] - pts[1]).distance) / 2;
+                final pr = edge * (f.$4 == 1 ? 0.12 : 0.085);
+                if (pr > 0.6) {
+                  const g = [0.25, 0.5, 0.75];
+                  final pip = Paint()..color = (f.$4 == 1 || f.$4 == 4 ? const Color(0xFFC0223F) : _ink).withAlpha(alpha);
+                  for (final i in _pips[f.$4] ?? const <int>[]) {
+                    final u = g[i % 3], v = g[i ~/ 3];
+                    final top = Offset.lerp(pts[0], pts[1], u)!, bot = Offset.lerp(pts[3], pts[2], u)!;
+                    canvas.drawCircle(Offset.lerp(top, bot, v)!, pr, pip);
+                  }
+                }
+                canvas.drawPath(
+                    path,
+                    Paint()
+                      ..style = PaintingStyle.stroke
+                      ..strokeJoin = StrokeJoin.round
+                      ..strokeWidth = max(1.5, s * cam.scaleAt(d.y) * 0.06)
+                      ..color = playerColors[d.owner].withAlpha(alpha));
+              }
+            }
+
+            @override
+            bool shouldRepaint(covariant RaceView old) => true;
+          }
+          ZAR_EOF
           cat > lib/race_screen.dart <<'ZAR_EOF'
           import 'dart:math';
 
@@ -607,11 +1001,12 @@ jobs:
           import 'errors.dart';
           import 'feel.dart';
           import 'race_physics.dart';
+          import 'race_view.dart';
           import 'rules.dart';
+          import 'track.dart';
 
           enum Stage { aiming, rolling, hopping, done }
 
-          const playerColors = [Color(0xFFFF4F9A), Color(0xFF2BB3A3)];
           const playerNames = ['1. oyuncu', '2. oyuncu'];
 
           /// Zar durunca beneklerin sayısı kadar zıplama, ardından turbo ya da kayma.
@@ -649,6 +1044,7 @@ jobs:
             double chargeT = 0;
             double power = 0;
             double camY = 0;
+            double camX = 0; // kameranın yana kayması (yol eksenine göre)
             int? winner; // -1: berabere
 
             String banner = '';
@@ -683,13 +1079,17 @@ jobs:
               return f <= 1 ? f : 2 - f;
             }
 
-            double _focusY() {
+            /// Kameranın takip edeceği nokta: atışta önde giden zar, beklerken sıradakinin zarları.
+            Offset _focus() {
               if (stage == Stage.rolling) {
                 final moving = sim.dice.where((d) => d.moving && !d.fallen).toList();
-                if (moving.isNotEmpty) return moving.map((d) => d.y).reduce(max);
+                if (moving.isNotEmpty) {
+                  final lead = moving.reduce((a, b) => a.y > b.y ? a : b);
+                  return Offset(lead.x, lead.y);
+                }
               }
               final mine = sim.diceOf(turn).toList();
-              return (mine[0].y + mine[1].y) / 2;
+              return Offset((mine[0].x + mine[1].x) / 2, (mine[0].y + mine[1].y) / 2);
             }
 
             void _onTick(Duration elapsed) {
@@ -705,8 +1105,10 @@ jobs:
               } else if (stage == Stage.hopping) {
                 _stepHops(dt);
               }
-              final focus = _focusY();
-              camY += (focus - camY) * min(1.0, dt * 3.0).toDouble();
+              final focus = _focus();
+              final k = min(1.0, dt * 3.0).toDouble();
+              camY += (focus.dy - camY) * k;
+              camX += (focus.dx - camX) * k;
               if (bannerT > 0) bannerT = max(0.0, bannerT - dt);
               _frame.value++;
             }
@@ -737,8 +1139,9 @@ jobs:
                   d.x = d.startX;
                   d.y = d.startY;
                 } else {
-                  d.x = d.startX.clamp(-RaceSim.roadWidth / 2 + 0.4, RaceSim.roadWidth / 2 - 0.4).toDouble();
                   d.y = max(0.0, d.startY - RaceRules.knockedOffPenalty);
+                  final half = Track.I.at(d.y).half - 0.3;
+                  d.x = d.startX.clamp(-half, half).toDouble();
                 }
                 d
                   ..z = 0
@@ -836,6 +1239,8 @@ jobs:
                   d.y = max(0.0, h.fromY + h.pips * RaceRules.meterPerPip + h.extra);
                   d.z = 0;
                 }
+                final half = Track.I.at(d.y).half - 0.3;
+                d.x += (d.x.clamp(-half, half).toDouble() - d.x) * min(1.0, dt * 8).toDouble();
               }
               if (allDone) _finishTurn();
             }
@@ -879,7 +1284,14 @@ jobs:
             Widget build(BuildContext context) {
               return Scaffold(
                 body: Stack(children: [
-                  Positioned.fill(child: CustomPaint(painter: _RacePainter(this, _frame))),
+                  Positioned.fill(
+                    child: ValueListenableBuilder<int>(
+                      valueListenable: _frame,
+                      builder: (context, _, __) =>
+                          CustomPaint(painter: RaceView(sim: sim, camX: camX, camY: camY, repaint: _frame)),
+                    ),
+                  ),
+                  Positioned(right: 0, top: 0, bottom: 0, width: 28, child: CustomPaint(painter: _MiniMap(this, _frame))),
                   Positioned(left: 0, right: 0, top: 0, child: SafeArea(child: _hud())),
                   Positioned.fill(child: IgnorePointer(child: _bannerView())),
                   Positioned(left: 0, right: 0, bottom: 0, child: SafeArea(child: _bottom())),
@@ -1064,136 +1476,18 @@ jobs:
             }
           }
 
-          /// Yol, mesafe çizgileri, zarlar ve yandaki yarış göstergesi.
-          class _RacePainter extends CustomPainter {
-            _RacePainter(this.s, Listenable repaint) : super(repaint: repaint);
-
+          /// Sağ kenarda dikey yarış göstergesi: iki oyuncunun nerede olduğu.
+          class _MiniMap extends CustomPainter {
+            _MiniMap(this.s, Listenable repaint) : super(repaint: repaint);
             final _RaceScreenState s;
-
-            static const _ink = Color(0xFF2A1A0C);
-            static const _pips = {
-              1: [4],
-              2: [0, 8],
-              3: [0, 4, 8],
-              4: [0, 2, 6, 8],
-              5: [0, 2, 4, 6, 8],
-              6: [0, 2, 3, 5, 6, 8],
-            };
 
             @override
             void paint(Canvas canvas, Size size) {
-              final pxm = size.width / (RaceSim.roadWidth + 1.4); // metre başına piksel
-              final baseY = size.height * 0.64;
-              Offset toScreen(double x, double y) => Offset(size.width / 2 + x * pxm, baseY - (y - s.camY) * pxm);
-
-              // çimen
-              canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFF4E7A2E));
-              final topM = s.camY + baseY / pxm + 1, botM = s.camY - (size.height - baseY) / pxm - 1;
-              final tuft = Paint()..color = const Color(0xFF3F6624);
-              for (var m = botM.floor(); m <= topM.ceil(); m++) {
-                final r = Random(m * 7919 + 13);
-                for (var k = 0; k < 4; k++) {
-                  final side = r.nextBool() ? 1.0 : -1.0;
-                  final x = side * (RaceSim.roadWidth / 2 + 0.15 + r.nextDouble() * 0.5);
-                  final p = toScreen(x, m + r.nextDouble());
-                  canvas.drawOval(Rect.fromCenter(center: p, width: pxm * 0.18, height: pxm * 0.08), tuft);
-                }
-              }
-
-              // yol
-              final left = toScreen(-RaceSim.roadWidth / 2, 0).dx, right = toScreen(RaceSim.roadWidth / 2, 0).dx;
-              canvas.drawRect(Rect.fromLTRB(left, 0, right, size.height), Paint()..color = const Color(0xFFDDB97E));
-              final edge = Paint()..color = const Color(0xFFA9824C);
-              canvas.drawRect(Rect.fromLTRB(left - 6, 0, left, size.height), edge);
-              canvas.drawRect(Rect.fromLTRB(right, 0, right + 6, size.height), edge);
-
-              // başlangıç çizgisi
-              final y0 = toScreen(0, 0).dy;
-              if (y0 > -20 && y0 < size.height + 20) {
-                const n = 12;
-                final cw = (right - left) / n;
-                for (var i = 0; i < n; i++) {
-                  for (var j = 0; j < 2; j++) {
-                    canvas.drawRect(Rect.fromLTWH(left + i * cw, y0 + j * cw * 0.6, cw, cw * 0.6),
-                        Paint()..color = (i + j).isEven ? const Color(0xFF1A1208) : const Color(0xFFFFFFFF));
-                  }
-                }
-              }
-
-              // mesafe çizgileri: her metre ince, her 5 metre kalın ve yazılı
-              for (var m = max(1, botM.floor()); m <= topM.ceil(); m++) {
-                final y = toScreen(0, m.toDouble()).dy;
-                final major = m % 5 == 0;
-                canvas.drawLine(Offset(left, y), Offset(right, y),
-                    Paint()
-                      ..color = major ? const Color(0x88FFFFFF) : const Color(0x33FFFFFF)
-                      ..strokeWidth = major ? 3 : 1);
-                if (major) {
-                  final tp = TextPainter(
-                    text: TextSpan(
-                        text: '$m m',
-                        style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700, shadows: [Shadow(color: Colors.black, blurRadius: 4)])),
-                    textDirection: TextDirection.ltr,
-                  )..layout();
-                  tp.paint(canvas, Offset(left - tp.width - 10, y - tp.height / 2));
-                }
-              }
-
-              // zarlar: alçaktan yükseğe
-              final list = [...s.sim.dice]..sort((a, b) => a.z.compareTo(b.z));
-              for (final d in list) {
-                _drawDie(canvas, d, toScreen, pxm);
-              }
-
-              _miniMap(canvas, size);
-            }
-
-            void _drawDie(Canvas canvas, RDie d, Offset Function(double, double) toScreen, double pxm) {
-              final falling = d.z < 0;
-              final lift = max(0.0, d.z);
-              final scale = falling ? (1 + d.z / 1.5).clamp(0.0, 1.0).toDouble() : 1 + lift * 0.5;
-              final size = RaceSim.dieSize * pxm * scale;
-              if (size < 1) return;
-              final c = toScreen(d.x, d.y);
-              if (!falling) {
-                canvas.drawOval(
-                  Rect.fromCenter(center: c + Offset(lift * pxm * 0.25 + size * 0.06, lift * pxm * 0.35 + size * 0.1), width: size * 0.95, height: size * 0.75),
-                  Paint()
-                    ..color = Color.fromRGBO(0, 0, 0, (0.35 - lift * 0.1).clamp(0.1, 0.35).toDouble())
-                    ..maskFilter = MaskFilter.blur(BlurStyle.normal, 3 + lift * 6),
-                );
-              }
-              canvas.save();
-              canvas.translate(c.dx, c.dy - lift * pxm * 0.15);
-              canvas.rotate(d.ang);
-              canvas.scale(1 + 0.3 * d.squash, 1 - 0.25 * d.squash);
-              final half = size / 2;
-              final body = RRect.fromRectAndRadius(Rect.fromCenter(center: Offset.zero, width: size, height: size), Radius.circular(size * 0.22));
-              final alpha = falling ? (1 + d.z / 1.5).clamp(0.0, 1.0).toDouble() : 1.0;
-              canvas.drawRRect(body, Paint()..color = const Color(0xFFFFF4DC).withAlpha((255 * alpha).round()));
-              canvas.drawOval(Rect.fromLTWH(-half * 0.75, -half * 0.82, size * 0.38, size * 0.2), Paint()..color = const Color(0x77FFFFFF));
-              canvas.drawRRect(
-                  body,
-                  Paint()
-                    ..style = PaintingStyle.stroke
-                    ..strokeWidth = max(2.0, size * 0.09)
-                    ..color = playerColors[d.owner].withAlpha((255 * alpha).round()));
-              const g = [0.27, 0.5, 0.73];
-              final pipPaint = Paint()..color = _ink.withAlpha((255 * alpha).round());
-              final r = size * (d.face == 1 ? 0.12 : 0.085);
-              for (final i in _pips[d.face] ?? const <int>[]) {
-                canvas.drawCircle(Offset((g[i % 3] - 0.5) * size, (g[i ~/ 3] - 0.5) * size), r, pipPaint);
-              }
-              canvas.restore();
-            }
-
-            /// Sağ kenarda dikey yarış göstergesi: iki oyuncunun nerede olduğu.
-            void _miniMap(Canvas canvas, Size size) {
-              final top = size.height * 0.2, bottom = size.height * 0.62;
-              final x = size.width - 14;
+              final top = size.height * 0.2, bottom = size.height * 0.6;
+              final x = size.width / 2;
               canvas.drawLine(Offset(x, top), Offset(x, bottom),
                   Paint()
-                    ..color = const Color(0x66FFFFFF)
+                    ..color = const Color(0x55000000)
                     ..strokeWidth = 4
                     ..strokeCap = StrokeCap.round);
               final s0 = s.score(0), s1 = s.score(1);
@@ -1208,18 +1502,19 @@ jobs:
                     Paint()
                       ..style = PaintingStyle.stroke
                       ..strokeWidth = 2
-                      ..color = _ink);
+                      ..color = const Color(0xFF2A1A0C));
               }
             }
 
             @override
-            bool shouldRepaint(covariant _RacePainter old) => true;
+            bool shouldRepaint(covariant _MiniMap old) => true;
           }
           ZAR_EOF
           cat > test/widget_test.dart <<'ZAR_EOF'
           import 'package:flutter_test/flutter_test.dart';
           import 'package:zar_yarisi/race_physics.dart';
           import 'package:zar_yarisi/rules.dart';
+          import 'package:zar_yarisi/track.dart';
 
           void main() {
             test('barbut atışları: turbo ve kayma', () {
@@ -1261,6 +1556,15 @@ jobs:
               for (var k = 0; k < 2; k++) {
                 if (!mine[k].fallen) expect(mine[k].face, r[k]);
               }
+            });
+
+            test('pist kesintisiz ve her cihazda aynı', () {
+              final segs = Track.I.segs;
+              for (var i = 1; i < segs.length; i++) {
+                expect(segs[i].from, segs[i - 1].to);
+              }
+              expect(Track.I.at(0).rails, true); // başlangıç korkuluklu
+              expect(segs.last.to > 300, true);
             });
           }
           ZAR_EOF
@@ -3913,4 +4217,3 @@ jobs:
         with:
           name: zar-yarisi-android
           path: zar_app/build/app/outputs/flutter-apk/app-release.apk
-
